@@ -1,183 +1,476 @@
 #!/usr/bin/env python3
+"""Update the seminar mirror using SingleFile snapshots (Python 3.9+).
 
+Save the main page and new/changed announcements into this directory, then
+run ./update. With no fresh main page, the existing index.html is reused.
+
+./update --dry-run   Preview changes; do not write, delete, commit or push.
+./update --local     Update/clean files, but do not stage, commit or push.
+./update            Update/clean files, commit, and push without force.
+
+Only recognized calendar snapshots are deduplicated. Each distinct event is
+retained, even when it is no longer linked from the main page. README files,
+scripts, unrelated files and Git history are not deleted. This is NOT a
+credential scanner or a tool for erasing data from Git history.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from hashlib import sha256
+from html import escape, unescape
+from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urljoin, urlsplit, urlunsplit, quote
-from datetime import datetime
-import html
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
 import os
 import re
+import stat
 import subprocess
 import sys
+import tempfile
 
 ROOT = Path(__file__).resolve().parent
-INDEX = ROOT / "index.html"
+MAIN_URL = "https://calendar.math.psu.edu/math_cal_dept/seminar.php?id=410"
+MIRROR_URL = "https://anton-petrunin.github.io/geometry-lunch-seminar-PSU/"
+OLD_MAIN_URL = "https://math-cal.cloud.science.psu.edu/events/seminar/410"
+HOSTS = {"calendar.math.psu.edu", "math-cal.cloud.science.psu.edu"}
+VOID = set("area base br col embed hr img input link meta param source track wbr".split())
 
-MAIN_URL = (
-    "https://calendar.math.psu.edu/"
-    "math_cal_dept/seminar.php?id=410"
+# Character codes avoid putting the literal account name in this public script.
+ACCOUNT_CODES = (97, 113, 112, 54)
+ACCOUNT_PATTERN = "".join(
+    "(?:" + re.escape(chr(n)) + r"|&#0*" + str(n) + r";?|&#x0*" + format(n, "x")
+    + r";?|%" + format(n, "02x") + ")" for n in ACCOUNT_CODES
+)
+ACCOUNT_RE = re.compile(ACCOUNT_PATTERN + r"(?:@psu\.edu)?", re.I)
+# Embedded image/font bytes are not user-visible account text. Do not corrupt them.
+OPAQUE_DATA = re.compile(r'''data:[^\s"'<>]+''', re.I)
+ATTR_RE = re.compile(
+    r'''(?P<name>[^\s=/>]+)(?:\s*=\s*(?:"(?P<dq>[^"]*)"|'(?P<sq>[^']*)'|(?P<uq>[^\s>]+)))?'''
 )
 
 
-def source_url(path):
-    text = path.read_text(encoding="utf-8", errors="replace")
+class UpdateError(Exception):
+    pass
+
+
+def normalized(url: str) -> str:
+    p = urlsplit(url.strip())
+    if p.scheme.lower() not in ("http", "https") or not p.hostname:
+        return ""
+    if p.username or p.password:
+        return ""
+    host = p.netloc.lower()
+    scheme = "https" if p.hostname.lower() in HOSTS else p.scheme.lower()
+    result = urlunsplit((scheme, host, p.path or "/", urlencode(sorted(parse_qsl(p.query, keep_blank_values=True))), ""))
+    if result == OLD_MAIN_URL:
+        return MAIN_URL
+    return result
+
+
+MAIN_KEY = normalized(MAIN_URL)
+
+
+class Metadata(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.canonical = ""
+        self.base = ""
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        a = dict(attrs)
+        if tag == "link" and "canonical" in (a.get("rel") or "").lower().split():
+            self.canonical = a.get("href") or ""
+        if tag == "base" and not self.base:
+            self.base = a.get("href") or ""
+
+
+def metadata(text: str) -> tuple[str, str, float | None]:
+    # The SingleFile comment precedes large embedded styles/images.
     head = text[:300000]
-
-    m = re.search(
-        r"Page saved with SingleFile.*?\burl:\s*(\S+)",
-        head, re.I | re.S
-    )
+    m = re.search(r"<!--\s*Page saved with SingleFile\b(.*?)-->", head, re.I | re.S)
+    source, saved = "", None
     if m:
-        return html.unescape(m.group(1).strip())
-
-    m = re.search(
-        r'<link[^>]+rel=["\'][^"\']*canonical[^"\']*["\'][^>]+'
-        r'href=["\']([^"\']+)',
-        head, re.I
-    )
-    if m:
-        return html.unescape(m.group(1))
-
-    return None
-
-
-def normalize(url):
-    p = urlsplit(html.unescape(url))
-    return urlunsplit((
-        p.scheme.lower(),
-        p.netloc.lower(),
-        p.path,
-        p.query,
-        ""
-    ))
+        u = re.search(r"^\s*url:\s*(.*?)\s*$", m.group(1), re.I | re.M)
+        if u:
+            source = unescape(u.group(1))
+        d = re.search(r"saved date:\s*(.*?)\s+GMT([+-]\d{4})", m.group(1), re.I)
+        if d:
+            try:
+                saved = datetime.strptime(d[1] + " " + d[2], "%a %b %d %Y %H:%M:%S %z").timestamp()
+            except ValueError:
+                pass
+    parser = Metadata()
+    parser.feed(text)
+    return source or parser.canonical, parser.base, saved
 
 
-# Find all SingleFile pages except generated index.html.
-pages = []
+@dataclass
+class Page:
+    path: Path
+    text: str
+    source: str
+    base: str
+    saved: float
+    mtime: float
 
-for path in ROOT.glob("*.html"):
-    if path.name == "index.html":
-        continue
+    @property
+    def key(self) -> str:
+        return normalized(self.source)
 
-    url = source_url(path)
-    if url:
-        pages.append((path, normalize(url)))
-
-
-# Find newest saved copy of the main page.
-main_key = normalize(MAIN_URL)
-main_pages = [p for p, u in pages if u == main_key]
-
-if not main_pages:
-    sys.exit("No saved copy of the main seminar page found.")
-
-main = max(main_pages, key=lambda p: p.stat().st_mtime)
-
-if INDEX.exists() and main.stat().st_mtime <= INDEX.stat().st_mtime:
-    sys.exit("No newer main seminar page found; nothing to update.")
-
-print(f"Main page: {main.name}")
+    @property
+    def rank(self) -> tuple:
+        # Prefer the actual capture date; filesystem mtimes change after cloning.
+        return self.saved, self.mtime, self.path.name
 
 
-# For every original URL choose the newest saved copy.
-url_to_file = {}
-
-for path, url in pages:
-    if url == main_key:
-        continue
-
-    old = url_to_file.get(url)
-
-    if old is None or path.stat().st_mtime > old.stat().st_mtime:
-        url_to_file[url] = path
-
-
-print(f"Saved linked pages: {len(url_to_file)}")
+def load_page(path: Path) -> Page:
+    if path.is_symlink():
+        raise UpdateError(f"Refusing to modify a symlink: {path.name}")
+    try:
+        text = path.read_bytes().decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise UpdateError(f"Not UTF-8 HTML: {path.name}") from exc
+    source, base, saved = metadata(text)
+    mtime = path.stat().st_mtime
+    return Page(path, text, source, base, saved if saved is not None else mtime, mtime)
 
 
-# Read fresh main page and rewrite links.
-text = main.read_text(encoding="utf-8", errors="replace")
-
-pattern = re.compile(
-    r'(<a\b[^>]*?\bhref\s*=\s*)(["\'])(.*?)(\2)',
-    re.I | re.S,
-)
-
-rewritten = 0
+def managed(page: Page) -> bool:
+    return bool(page.key) and urlsplit(page.key).hostname in HOSTS
 
 
-def replace_link(m):
-    global rewritten
-
-    prefix, q, href, _ = m.groups()
-    raw = html.unescape(href)
-
-    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", raw) \
-            and not raw.startswith(("http:", "https:")):
-        return m.group(0)
-
-    absolute = urljoin(MAIN_URL, raw)
-    parts = urlsplit(absolute)
-    key = normalize(absolute)
-
-    path = url_to_file.get(key)
-    if path is None:
-        return m.group(0)
-
-    local = quote(path.name)
-
-    if parts.fragment:
-        local += "#" + quote(parts.fragment)
-
-    rewritten += 1
-    return prefix + q + local + q
+def destination(key: str) -> str:
+    if key == MAIN_KEY:
+        return "index.html"
+    p = urlsplit(key)
+    args = dict(parse_qsl(p.query))
+    if (p.hostname == "calendar.math.psu.edu" and p.path == "/math_cal_dept/event.php"
+            and set(args) == {"id"} and re.fullmatch(r"[0-9]+", args["id"])):
+        return "event-" + args["id"] + ".html"
+    return "page-" + sha256(key.encode()).hexdigest()[:16] + ".html"
 
 
-text = pattern.sub(replace_link, text)
+def redact(text: str) -> tuple[str, int]:
+    """Remove the account text, including common HTML/URL-encoded forms."""
+    result, cursor, count = [], 0, 0
+    for m in OPAQUE_DATA.finditer(text):
+        clean, n = ACCOUNT_RE.subn("", text[cursor:m.start()])
+        result.extend((clean, m.group(0)))
+        count += n
+        cursor = m.end()
+    clean, n = ACCOUNT_RE.subn("", text[cursor:])
+    result.append(clean)
+    return "".join(result), count + n
 
 
-# Write index atomically.
-tmp = ROOT / ".index.html.tmp"
-tmp.write_text(text, encoding="utf-8")
-os.replace(tmp, INDEX)
-
-# The freshly saved main-page file is now redundant.
-main.unlink()
-
-print(f"Rewrote {rewritten} links.")
-print("Created index.html.")
-
-
-# Stage only HTML files -- not cookies or other accidental files.
-subprocess.run(
-    ["git", "add", "-A", "--", "*.html"],
-    cwd=ROOT,
-    check=True,
-)
-
-# Nothing changed?
-result = subprocess.run(
-    ["git", "diff", "--cached", "--quiet"],
-    cwd=ROOT,
-)
-
-if result.returncode == 0:
-    print("No Git changes.")
-    sys.exit(0)
+def set_attribute(raw: str, name: str, value: str) -> str:
+    """Change one attribute, including unquoted attributes, without reformatting HTML."""
+    tag = re.match(r"<[^\s/>]+", raw)
+    if not tag:
+        return raw
+    for m in ATTR_RE.finditer(raw, tag.end()):
+        if m["name"].lower() == name:
+            return raw[:m.start()] + name + '="' + escape(value, quote=True) + '"' + raw[m.end():]
+    return raw
 
 
-message = "Update seminar mirror " + \
-          datetime.now().astimezone().strftime("%Y-%m-%d")
+class Editor(HTMLParser):
+    """Patch original text, preserving embedded styles, scripts and math markup."""
+    def __init__(self, text: str, resolve) -> None:
+        super().__init__(convert_charrefs=False)
+        self.text = text
+        self.resolve = resolve
+        self.starts = [0] + [m.end() for m in re.finditer("\n", text)]
+        self.edits = []
+        self.hidden_start = None
+        self.hidden_stack = []
+        self.link_changes = 0
+        self.user_blocks = 0
 
-subprocess.run(
-    ["git", "commit", "-m", message],
-    cwd=ROOT,
-    check=True,
-)
+    def char_pos(self) -> int:
+        line, col = self.getpos()
+        return self.starts[line - 1] + col
 
-subprocess.run(
-    ["git", "push"],
-    cwd=ROOT,
-    check=True,
-)
+    def start(self, tag: str, attrs: list, closed: bool) -> None:
+        raw = self.get_starttag_text()
+        start = self.char_pos()
+        leaf = closed or tag in VOID
+        if self.hidden_start is not None:
+            if not leaf:
+                self.hidden_stack.append(tag)
+            return
+        a = dict(attrs)
+        classes = (a.get("class") or "").lower().split()
+        if "site-user" in classes or (a.get("id") or "").lower() == "site-user":
+            self.user_blocks += 1
+            if leaf:
+                self.edits.append((start, start + len(raw), ""))
+            else:
+                self.hidden_start, self.hidden_stack = start, [tag]
+            return
+        updated = raw
+        if tag in ("a", "area") and a.get("href") is not None:
+            value = self.resolve(a["href"])
+            if value != a["href"]:
+                updated = set_attribute(raw, "href", value)
+                self.link_changes += 1
+        elif tag == "base" and a.get("href") is not None:
+            # Otherwise relative archive links could resolve to the original server.
+            updated = ""
+        if updated != raw:
+            self.edits.append((start, start + len(raw), updated))
 
-print("Published.")
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        self.start(tag, attrs, False)
+
+    def handle_startendtag(self, tag: str, attrs: list) -> None:
+        self.start(tag, attrs, True)
+
+    def handle_endtag(self, tag: str) -> None:
+        if self.hidden_start is not None and tag in self.hidden_stack:
+            i = len(self.hidden_stack) - 1 - self.hidden_stack[::-1].index(tag)
+            del self.hidden_stack[i:]
+            if not self.hidden_stack:
+                end = self.text.find(">", self.char_pos())
+                if end < 0:
+                    raise UpdateError("Unclosed account block in HTML; nothing deleted.")
+                self.edits.append((self.hidden_start, end + 1, ""))
+                self.hidden_start = None
+
+    def result(self) -> str:
+        self.feed(self.text)
+        self.close()
+        if self.hidden_start is not None:
+            raise UpdateError("Unclosed .site-user block; refusing to truncate a page.")
+        parts, cursor = [], 0
+        for start, end, replacement in sorted(self.edits):
+            if start < cursor:
+                raise UpdateError("Overlapping HTML edits; nothing deleted.")
+            parts.extend((self.text[cursor:start], replacement))
+            cursor = end
+        parts.append(self.text[cursor:])
+        return "".join(parts)
+
+
+def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+    result = subprocess.run(["git", *args], cwd=ROOT, text=True, capture_output=True)
+    if check and result.returncode:
+        raise UpdateError(result.stderr.strip() or result.stdout.strip() or "Git command failed.")
+    return result
+
+
+def atomic_write(path: Path, data: bytes) -> None:
+    mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o644
+    fd, name = tempfile.mkstemp(prefix=".mirror-", suffix=".tmp", dir=ROOT)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(name, mode)
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def build_plan() -> tuple[dict[str, bytes], set[str], set[str]]:
+    paths = sorted(p for p in ROOT.iterdir() if p.suffix.lower() in (".html", ".htm"))
+    pages = [load_page(p) for p in paths]
+    winners: dict[str, Page] = {}
+    for page in pages:
+        if managed(page) and (page.key not in winners or page.rank > winners[page.key].rank):
+            winners[page.key] = page
+    if MAIN_KEY not in winners:
+        raise UpdateError("No saved main page or recognizable index.html. Save the main page with SingleFile first.")
+    if any(p.path.name == "index.html" and p.key != MAIN_KEY for p in pages):
+        raise UpdateError("index.html is not the seminar page; refusing to overwrite it.")
+    names = {key: destination(key) for key in winners}
+    if len(set(names.values())) != len(names):
+        raise UpdateError("Output filename collision; nothing changed.")
+    by_name = {p.path.name: p.key for p in pages if managed(p)}
+    by_name.update({name: key for key, name in names.items()})
+    missing = set()
+
+    def resolver(page: Page):
+        def resolve(href: str) -> str:
+            raw = href.strip()
+            if not raw or raw.startswith("#"):
+                return href
+            split = urlsplit(raw)
+            if split.scheme and split.scheme.lower() not in ("http", "https"):
+                return href
+            key = ""
+            # Also fix links that earlier versions already changed to local filenames.
+            if not split.netloc and not split.scheme and not split.query:
+                local = unquote(split.path)
+                if local.startswith("./"):
+                    local = local[2:]
+                key = by_name.get(local, "")
+            elif raw.startswith(MIRROR_URL) and not split.query:
+                local = unquote(split.path[len(urlsplit(MIRROR_URL).path):])
+                key = by_name.get(local, "")
+            absolute = urljoin(urljoin(page.source or MAIN_URL, page.base), raw)
+            key = key or normalized(absolute)
+            if key in names:
+                fragment = ("#" + split.fragment) if split.fragment else ""
+                return quote(names[key], safe="-._~") + fragment
+            if (page.key == MAIN_KEY and urlsplit(absolute).hostname in HOSTS
+                    and urlsplit(absolute).path.endswith("/event.php")):
+                missing.add(normalized(absolute))
+            if not split.scheme and not split.netloc and split.path:
+                # Unsaved relative server links must not become broken local links.
+                local = ROOT / unquote(split.path)
+                if not local.is_file():
+                    return absolute
+            return href
+        return resolve
+
+    writes: dict[str, bytes] = {}
+    links = blocks = redactions = 0
+    # Keep every distinct announcement, not merely those in the current schedule.
+    for key, page in winners.items():
+        target = ROOT / names[key]
+        if target.is_symlink():
+            raise UpdateError(f"Output is a symlink: {target.name}")
+        existing = next((p for p in pages if p.path == target), None)
+        if target.exists() and (existing is None or existing.key != key):
+            raise UpdateError(f"Refusing to overwrite an unrelated file: {target.name}")
+        editor = Editor(page.text, resolver(page))
+        result, count = redact(editor.result())
+        if normalized(metadata(result)[0]) != key:
+            raise UpdateError(f"Source metadata lost in {page.path.name}; nothing changed.")
+        writes[target.name] = result.encode("utf-8")
+        links += editor.link_changes
+        blocks += editor.user_blocks
+        redactions += count
+    # Sanitize other HTML too, but do not delete or publish untracked unrelated pages.
+    tracked = set(git("ls-files", "-z").stdout.split("\0"))
+    for page in pages:
+        if not managed(page):
+            editor = Editor(page.text, resolver(page))
+            result, count = redact(editor.result())
+            if result != page.text:
+                if page.path.name not in tracked:
+                    raise UpdateError(f"Untracked unrelated HTML needs review: {page.path.name}. Move it out of the repository before updating.")
+                writes[page.path.name] = result.encode("utf-8")
+            links += editor.link_changes
+            blocks += editor.user_blocks
+            redactions += count
+    deletes = {p.path.name for p in pages if managed(p) and p.path.name not in writes}
+    # Remove old backups only when their source page survives in the output.
+    backup_paths = list(ROOT.glob("*.html.bak")) + list(ROOT.glob("*.html~"))
+    if (ROOT / ".index.html.tmp").exists():
+        backup_paths.append(ROOT / ".index.html.tmp")
+    for path in backup_paths:
+        page = load_page(path)
+        if managed(page) and page.key in winners and page.saved <= winners[page.key].saved:
+            deletes.add(path.name)
+        else:
+            print(f"Keeping unrecognized or newer backup: {path.name}")
+    output_names = set(writes)
+    writes = {name: data for name, data in writes.items()
+              if not (ROOT / name).exists() or (ROOT / name).read_bytes() != data}
+    print(f"Main source: {winners[MAIN_KEY].path.name}")
+    print(f"Keeping {len(winners) - 1} distinct linked/archived pages.")
+    print(f"Links updated: {links}; account blocks removed: {blocks}; extra redactions: {redactions}.")
+    print(f"Files to write: {len(writes)}; redundant snapshots/backups to delete: {len(deletes)}.")
+    if missing:
+        print(f"Warning: {len(missing)} event page(s) not saved locally; their links remain on the original site.")
+    return writes, deletes, output_names
+
+
+def apply(writes: dict[str, bytes], deletes: set[str]) -> None:
+    # Hold originals in memory during the filesystem transaction; no public .bak files.
+    originals = {name: (ROOT / name).read_bytes() if (ROOT / name).exists() else None
+                 for name in writes.keys() | deletes}
+    try:
+        # Complete every replacement before removing any source snapshot.
+        for name, data in writes.items():
+            atomic_write(ROOT / name, data)
+        for name in sorted(deletes):
+            (ROOT / name).unlink(missing_ok=True)
+    except (OSError, KeyboardInterrupt):
+        for name, data in originals.items():
+            if data is None:
+                (ROOT / name).unlink(missing_ok=True)
+            else:
+                atomic_write(ROOT / name, data)
+        raise
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true")
+    mode.add_argument("--local", action="store_true")
+    args = parser.parse_args()
+    top = Path(git("rev-parse", "--show-toplevel").stdout.strip()).resolve()
+    if top != ROOT:
+        raise UpdateError("Place update in the root of the mirror's Git repository.")
+    if git("ls-files", "-u").stdout:
+        raise UpdateError("Resolve the Git merge conflicts before updating.")
+    branch = git("symbolic-ref", "--short", "HEAD").stdout.strip()
+    writes, deletes, output_names = build_plan()
+    staged = set(filter(None, git("diff", "--cached", "--name-only", "-z").stdout.split("\0")))
+    # Recover staging after --local, a failed commit, or an interrupted earlier run.
+    absent = set(filter(None, git("ls-files", "--deleted", "-z").stdout.split("\0")))
+    absent |= {name for name in staged if not (ROOT / name).exists()}
+    for name in absent:
+        if "/" in name:
+            continue
+        previous = git("show", ":" + name, check=False)
+        if previous.returncode:
+            previous = git("show", "HEAD:" + name, check=False)
+        if not previous.returncode:
+            source = metadata(previous.stdout)[0]
+            key = normalized(source)
+            if key and urlsplit(key).hostname in HOSTS and destination(key) in output_names:
+                deletes.add(name)
+    if args.dry_run:
+        for name in sorted(writes):
+            print("WRITE  " + name)
+        for name in sorted(deletes):
+            print("DELETE " + name)
+        print("Preview only: nothing changed, committed or pushed.")
+        return 0
+    allowed = output_names | deletes | {Path(__file__).name}
+    if not args.local and staged - allowed:
+        raise UpdateError("Other files are already staged. Commit or unstage them first: " + ", ".join(sorted(staged - allowed)))
+    if not args.local:
+        git("remote", "get-url", "origin")
+    apply(writes, deletes)
+    if args.local:
+        print("Local files updated. Git was not staged, committed or pushed.")
+        return 0
+    tracked = set(git("ls-files", "-z").stdout.split("\0"))
+    paths = sorted(name for name in allowed if (ROOT / name).exists() or name in tracked)
+    if paths:
+        git("add", "-A", "--", *(":(literal)" + name for name in paths))
+    diff = git("diff", "--cached", "--quiet", check=False)
+    if diff.returncode == 1:
+        print(git("commit", "-m", "Update seminar mirror " + datetime.now(timezone.utc).strftime("%Y-%m-%d")).stdout.strip())
+    elif diff.returncode != 0:
+        raise UpdateError(diff.stderr.strip() or "Could not check staged changes.")
+    else:
+        print("No new changes to commit.")
+    # Always retry a pending push, even after an earlier push failed.
+    result = git("push", "-u", "origin", branch, check=False)
+    if result.returncode:
+        raise UpdateError("Files are updated locally, but push failed. No need to save the pages again; fix Git access and rerun ./update.\n" + result.stderr.strip())
+    print("Pushed to GitHub. GitHub Pages deployment may still be running.")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (UpdateError, OSError, ValueError) as exc:
+        print("ERROR: " + str(exc), file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("Cancelled.", file=sys.stderr)
+        sys.exit(130)

@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+
+from pathlib import Path
+from urllib.parse import urljoin, urlsplit, urlunsplit, quote
+from datetime import datetime
+import html
+import os
+import re
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parent
+INDEX = ROOT / "index.html"
+
+MAIN_URL = (
+    "https://calendar.math.psu.edu/"
+    "math_cal_dept/seminar.php?id=410"
+)
+
+
+def source_url(path):
+    text = path.read_text(encoding="utf-8", errors="replace")
+    head = text[:300000]
+
+    m = re.search(
+        r"Page saved with SingleFile.*?\burl:\s*(\S+)",
+        head, re.I | re.S
+    )
+    if m:
+        return html.unescape(m.group(1).strip())
+
+    m = re.search(
+        r'<link[^>]+rel=["\'][^"\']*canonical[^"\']*["\'][^>]+'
+        r'href=["\']([^"\']+)',
+        head, re.I
+    )
+    if m:
+        return html.unescape(m.group(1))
+
+    return None
+
+
+def normalize(url):
+    p = urlsplit(html.unescape(url))
+    return urlunsplit((
+        p.scheme.lower(),
+        p.netloc.lower(),
+        p.path,
+        p.query,
+        ""
+    ))
+
+
+# Find all SingleFile pages except generated index.html.
+pages = []
+
+for path in ROOT.glob("*.html"):
+    if path.name == "index.html":
+        continue
+
+    url = source_url(path)
+    if url:
+        pages.append((path, normalize(url)))
+
+
+# Find newest saved copy of the main page.
+main_key = normalize(MAIN_URL)
+main_pages = [p for p, u in pages if u == main_key]
+
+if not main_pages:
+    sys.exit("No saved copy of the main seminar page found.")
+
+main = max(main_pages, key=lambda p: p.stat().st_mtime)
+
+if INDEX.exists() and main.stat().st_mtime <= INDEX.stat().st_mtime:
+    sys.exit("No newer main seminar page found; nothing to update.")
+
+print(f"Main page: {main.name}")
+
+
+# For every original URL choose the newest saved copy.
+url_to_file = {}
+
+for path, url in pages:
+    if url == main_key:
+        continue
+
+    old = url_to_file.get(url)
+
+    if old is None or path.stat().st_mtime > old.stat().st_mtime:
+        url_to_file[url] = path
+
+
+print(f"Saved linked pages: {len(url_to_file)}")
+
+
+# Read fresh main page and rewrite links.
+text = main.read_text(encoding="utf-8", errors="replace")
+
+pattern = re.compile(
+    r'(<a\b[^>]*?\bhref\s*=\s*)(["\'])(.*?)(\2)',
+    re.I | re.S,
+)
+
+rewritten = 0
+
+
+def replace_link(m):
+    global rewritten
+
+    prefix, q, href, _ = m.groups()
+    raw = html.unescape(href)
+
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", raw) \
+            and not raw.startswith(("http:", "https:")):
+        return m.group(0)
+
+    absolute = urljoin(MAIN_URL, raw)
+    parts = urlsplit(absolute)
+    key = normalize(absolute)
+
+    path = url_to_file.get(key)
+    if path is None:
+        return m.group(0)
+
+    local = quote(path.name)
+
+    if parts.fragment:
+        local += "#" + quote(parts.fragment)
+
+    rewritten += 1
+    return prefix + q + local + q
+
+
+text = pattern.sub(replace_link, text)
+
+
+# Write index atomically.
+tmp = ROOT / ".index.html.tmp"
+tmp.write_text(text, encoding="utf-8")
+os.replace(tmp, INDEX)
+
+# The freshly saved main-page file is now redundant.
+main.unlink()
+
+print(f"Rewrote {rewritten} links.")
+print("Created index.html.")
+
+
+# Stage only HTML files -- not cookies or other accidental files.
+subprocess.run(
+    ["git", "add", "-A", "--", "*.html"],
+    cwd=ROOT,
+    check=True,
+)
+
+# Nothing changed?
+result = subprocess.run(
+    ["git", "diff", "--cached", "--quiet"],
+    cwd=ROOT,
+)
+
+if result.returncode == 0:
+    print("No Git changes.")
+    sys.exit(0)
+
+
+message = "Update seminar mirror " + \
+          datetime.now().astimezone().strftime("%Y-%m-%d")
+
+subprocess.run(
+    ["git", "commit", "-m", message],
+    cwd=ROOT,
+    check=True,
+)
+
+subprocess.run(
+    ["git", "push"],
+    cwd=ROOT,
+    check=True,
+)
+
+print("Published.")
